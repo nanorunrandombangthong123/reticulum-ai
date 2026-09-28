@@ -6,55 +6,67 @@ import { Worker, isMainThread, parentPort, workerData } from 'worker_threads';
 import { CortexCrypto } from '../core/crypto';
 import { CortexRandomX } from '../core/randomx';
 
-if (!isMainThread) {
-    let currentJob: any = null;
-    let isRunning = true;
+// =============================================================================
+// WORKER THREAD: hashes in short time slices so it reports progress often,
+// keeps its nonce per job, and reports crashes back to the main thread.
+// =============================================================================
+function runWorker() {
+    const threadId = Number(workerData?.threadId) || 0;
+    const totalThreads = Number(workerData?.totalThreads) || 1;
+    const SLICE_MS = 200;
 
-    parentPort?.on('message', (msg) => {
+    let job: any = null;
+    let nonce = 0;
+    let readyReported = false;
+
+    parentPort?.on('message', (msg: any) => {
         if (msg.type === 'job') {
-            currentJob = msg.job;
+            job = msg.job;
+            nonce = Math.floor(Math.random() * 50_000_000) * totalThreads + threadId;
         } else if (msg.type === 'stop') {
-            isRunning = false;
             process.exit(0);
         }
     });
 
-    const threadId = Number(workerData?.threadId) || 0;
-    const totalThreads = Number(workerData?.totalThreads) || 1;
+    function loop() {
+        if (!job) {
+            setTimeout(loop, 50);
+            return;
+        }
+        const j = job;
+        const started = Date.now();
+        let count = 0;
 
-    function runWorkerBatch() {
-        if (!isRunning) return;
-        if (!currentJob) {
-            setTimeout(runWorkerBatch, 25);
+        try {
+            do {
+                const header = `${j.headerPrefix}${nonce}${j.headerSuffix}`;
+                const hash = CortexRandomX.hash(header, j.seed, j.templateIndex);
+                count++;
+                if (hash.startsWith(j.targetPrefix)) {
+                    parentPort?.postMessage({ type: 'found', nonce, hash, templateIndex: j.templateIndex, jobId: j.jobId });
+                }
+                nonce += totalThreads;
+            } while (Date.now() - started < SLICE_MS);
+        } catch (e: any) {
+            parentPort?.postMessage({ type: 'error', message: String(e?.message || e) });
+            setTimeout(loop, 2000);
             return;
         }
 
-        const { headerPrefix, headerSuffix, targetPrefix, seed, templateIndex } = currentJob;
-        let nonce = Math.floor(Math.random() * 50000000) * totalThreads + threadId;
-        const BATCH = 1500;
-
-        for (let i = 0; i < BATCH; i++) {
-            const header = `${headerPrefix}${nonce}${headerSuffix}`;
-            const hash = CortexRandomX.hash(header, seed, templateIndex);
-
-            if (hash.startsWith(targetPrefix)) {
-                parentPort?.postMessage({
-                    type: 'found',
-                    nonce,
-                    hash,
-                    templateIndex
-                });
-            }
-            nonce += totalThreads;
+        if (!readyReported) {
+            readyReported = true;
+            parentPort?.postMessage({ type: 'ready', firstSliceMs: Date.now() - started });
         }
-
-        parentPort?.postMessage({ type: 'hashes', count: BATCH });
-        setImmediate(runWorkerBatch);
+        parentPort?.postMessage({ type: 'hashes', count });
+        setImmediate(loop); // lets 'job' / 'stop' messages through between slices
     }
 
-    runWorkerBatch();
-} else {
+    loop();
+}
 
+// =============================================================================
+// MAIN THREAD
+// =============================================================================
 let NODE_URL = process.env.NODE_URL || 'https://reticulum-ai.xyz';
 let minerAddress = process.env.MINER_ADDRESS || '';
 let allocatedThreads = Number(process.env.MINER_THREADS) || Math.max(1, Math.floor(os.cpus().length / 2));
@@ -64,17 +76,52 @@ let workerId = 'worker-1';
 const CONFIG_DIR = path.join(os.homedir(), '.reticulum');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'miner_config.json');
 
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-});
+let rl: readline.Interface | null = null;
 
-function askQuestion(query: string): Promise<string> {
-    return new Promise(resolve => rl.question(query, resolve));
+// ---- runtime state ----------------------------------------------------------
+let initialBalance = -1;
+let lastKnownBalance = 0;
+let localBlocksFound = 0;
+let poolSharesAccepted = 0;
+let sharesFoundByWorkers = 0;
+let sharesRejected = 0;
+let sharesStale = 0;
+let localTotalHashes = 0;
+let localHashrate = 0;
+let workersReady = 0;
+let spinnerIdx = 0;
+let isMiningRunning = true;
+let currentTemplate: any = null;
+let currentJobInfo = '';
+let latestJobId = 0;
+let nextJobId = 1;
+let headerDrift = false;
+// The exact template each job was built from. Shares MUST be submitted with the
+// template their hash was computed from, not with whatever the node returned last.
+const jobTemplates = new Map<number, any>();
+let lastTemplateAt = 0;
+let lastError = '';
+let lastErrorAt = 0;
+const SPINNERS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const activityLog: string[] = [];
+const activeWorkers: Worker[] = [];
+
+function sleep(ms: number) {
+    return new Promise<void>(r => setTimeout(r, ms));
 }
 
-function clearScreen() {
-    process.stdout.write('\x1b[2J\x1b[0;0H');
+function setError(msg: string) {
+    lastError = msg;
+    lastErrorAt = Date.now();
+}
+
+function logActivity(line: string) {
+    activityLog.unshift(line);
+    if (activityLog.length > 5) activityLog.pop();
+}
+
+function askQuestion(query: string): Promise<string> {
+    return new Promise(resolve => rl!.question(query, resolve));
 }
 
 function stripAnsi(str: string): string {
@@ -82,26 +129,25 @@ function stripAnsi(str: string): string {
 }
 
 function padVisible(str: string, targetLength: number): string {
-    const visibleLength = stripAnsi(str).length;
-    const paddingNeeded = Math.max(0, targetLength - visibleLength);
-    return str + ' '.repeat(paddingNeeded);
+    return str + ' '.repeat(Math.max(0, targetLength - stripAnsi(str).length));
+}
+
+function fmtRate(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)} MH/s`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(2)} kH/s`;
+    return `${n} H/s`;
 }
 
 function loadSavedConfig() {
     try {
-        if (fs.existsSync(CONFIG_FILE)) {
-            const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
-            return JSON.parse(raw);
-        }
+        if (fs.existsSync(CONFIG_FILE)) return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     } catch {}
     return null;
 }
 
 function saveConfig(config: any) {
     try {
-        if (!fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true });
-        }
+        if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
     } catch (e) {
         console.error('Error saving miner config:', e);
@@ -112,21 +158,18 @@ function sanitizeNodeUrl(rawUrl: string): string {
     if (!rawUrl) return 'https://reticulum-ai.xyz';
     let clean = rawUrl.trim();
     clean = clean.replace(/::+/g, ':');
-    if (clean.includes(':3333')) {
-        clean = clean.replace(':3333', '');
-    }
-    if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
-        clean = 'https://' + clean;
-    }
-    clean = clean.replace(/\/+$/, '');
-    return clean;
+    if (clean.includes(':3333')) clean = clean.replace(':3333', '');
+    if (!clean.startsWith('http://') && !clean.startsWith('https://')) clean = 'https://' + clean;
+    return clean.replace(/\/+$/, '');
 }
 
 async function fetchJson(endpoint: string, options: any = {}): Promise<any> {
+    const url = `${sanitizeNodeUrl(NODE_URL)}${endpoint}`;
+    let res: Response;
     try {
-        const url = `${sanitizeNodeUrl(NODE_URL)}${endpoint}`;
-        const res = await fetch(url, {
+        res = await fetch(url, {
             ...options,
+            signal: AbortSignal.timeout(8000),
             body: options.body ? (typeof options.body === 'string' ? options.body : JSON.stringify(options.body)) : undefined,
             headers: {
                 'Content-Type': 'application/json',
@@ -134,18 +177,22 @@ async function fetchJson(endpoint: string, options: any = {}): Promise<any> {
                 ...(options.headers || {})
             }
         });
-        const text = await res.text();
-        try {
-            return JSON.parse(text);
-        } catch {
-            throw new Error(`Node returned non-JSON response (HTTP ${res.status}): ${text.substring(0, 100)}`);
-        }
     } catch (e: any) {
-        throw new Error(`Connection to node (${NODE_URL}) failed: ${e.message}`);
+        throw new Error(`cannot reach ${NODE_URL}: ${e.message}`);
+    }
+    const text = await res.text();
+    try {
+        return JSON.parse(text);
+    } catch {
+        throw new Error(`non-JSON reply (HTTP ${res.status}): ${text.substring(0, 100)}`);
     }
 }
 
+// ---- setup / wallet wizard --------------------------------------------------
 async function setupMiner() {
+    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('SIGINT', shutdown);
+
     console.log('\x1b[36m╔══════════════════════════════════════════════════════════════════════╗\x1b[0m');
     console.log('\x1b[36m║\x1b[0m   \x1b[1;35m🧠 RETICULUM AI ($RAIX) - HARDWARE CPU & POOL MINER\x1b[0m              \x1b[36m║\x1b[0m');
     console.log('\x1b[36m╚══════════════════════════════════════════════════════════════════════╝\x1b[0m\n');
@@ -154,28 +201,29 @@ async function setupMiner() {
     console.log(`\x1b[32m[SYSTEM]\x1b[0m Detected CPU Hardware: \x1b[1m${os.cpus()[0]?.model || 'Multi-Core CPU'}\x1b[0m`);
     console.log(`\x1b[32m[SYSTEM]\x1b[0m Available Hardware Threads: \x1b[1;33m${totalCpus} Cores/Threads\x1b[0m\n`);
 
-    // Parse CLI arguments: --address/-a, --threads/-t, --mode/-m, --node/-n
+    // CLI: --address/-a, --threads/-t, --mode/-m, --node/-n, --worker/-w
     const args = process.argv.slice(2);
     let cliAddress = process.env.MINER_ADDRESS || '';
     let cliThreads = Number(process.env.MINER_THREADS) || 0;
     let cliMode = (process.env.MINING_MODE as 'pool' | 'solo') || '';
     let cliNode = process.env.NODE_URL || '';
+    let cliWorker = '';
 
     for (let i = 0; i < args.length; i++) {
-        if ((args[i] === '--address' || args[i] === '-a') && args[i + 1]) {
-            cliAddress = args[++i];
-        } else if ((args[i] === '--threads' || args[i] === '-t') && args[i + 1]) {
-            cliThreads = parseInt(args[++i], 10);
-        } else if ((args[i] === '--mode' || args[i] === '-m') && args[i + 1]) {
+        if ((args[i] === '--address' || args[i] === '-a') && args[i + 1]) cliAddress = args[++i];
+        else if ((args[i] === '--threads' || args[i] === '-t') && args[i + 1]) cliThreads = parseInt(args[++i], 10);
+        else if ((args[i] === '--mode' || args[i] === '-m') && args[i + 1]) {
             const m = args[++i].toLowerCase();
-            if (m === 'solo' || m === 'pool') cliMode = m as any;
-        } else if ((args[i] === '--node' || args[i] === '-n') && args[i + 1]) {
-            cliNode = args[++i];
-        }
+            if (m === 'solo' || m === 'pool') cliMode = m;
+        } else if ((args[i] === '--node' || args[i] === '-n') && args[i + 1]) cliNode = args[++i];
+        else if ((args[i] === '--worker' || args[i] === '-w') && args[i + 1]) cliWorker = args[++i];
     }
+
+    const defaultWorker = os.hostname().substring(0, 12) || 'worker-1';
 
     if (cliAddress) {
         minerAddress = cliAddress;
+        workerId = cliWorker || defaultWorker;
         if (cliThreads && cliThreads >= 1) allocatedThreads = Math.min(cliThreads, totalCpus);
         if (cliMode) miningMode = cliMode;
         if (cliNode) NODE_URL = sanitizeNodeUrl(cliNode);
@@ -184,17 +232,9 @@ async function setupMiner() {
         console.log(`\x1b[32m[AUTO-START]\x1b[0m CPU Threads    : \x1b[1;33m${allocatedThreads} Threads\x1b[0m`);
         console.log(`\x1b[32m[AUTO-START]\x1b[0m Node URL       : \x1b[1m${NODE_URL}\x1b[0m\n`);
 
-        saveConfig({
-            minerAddress,
-            miningMode,
-            workerId,
-            threads: allocatedThreads,
-            nodeUrl: NODE_URL,
-            savedAt: new Date().toISOString()
-        });
-
+        saveConfig({ minerAddress, miningMode, workerId, threads: allocatedThreads, nodeUrl: NODE_URL, savedAt: new Date().toISOString() });
         console.log('\x1b[35mStarting mining dashboard in 2 seconds...\x1b[0m');
-        await new Promise(r => setTimeout(r, 2000));
+        await sleep(2000);
         return;
     }
 
@@ -209,26 +249,23 @@ async function setupMiner() {
         if (!answer.trim() || answer.trim().toLowerCase() === 'y') {
             minerAddress = saved.minerAddress;
             miningMode = saved.miningMode || 'pool';
-            workerId = saved.workerId || 'worker-1';
-            allocatedThreads = saved.threads || allocatedThreads;
+            workerId = saved.workerId || defaultWorker;
+            allocatedThreads = Math.min(saved.threads || allocatedThreads, totalCpus);
             NODE_URL = sanitizeNodeUrl(saved.nodeUrl || NODE_URL);
             return;
         }
     }
 
-    // 1. Choose Mining Mode
     console.log('\x1b[1mSelect Mining Strategy:\x1b[0m');
     console.log('  \x1b[36m[1]\x1b[0m \x1b[1;32mCollaborative Mining Pool (Recommended)\x1b[0m - Lower share difficulty, regular PPLNS payouts');
     console.log('  \x1b[36m[2]\x1b[0m \x1b[1;33mSolo Hardware Mining\x1b[0m - Full 50 RAIX block rewards upon solving network difficulty');
     const modeChoice = (await askQuestion('\nSelect mining mode [1-2] (default: 1): ')).trim() || '1';
     miningMode = modeChoice === '2' ? 'solo' : 'pool';
 
-    // 2. Choose or Create Wallet
     console.log('\n\x1b[1mPlease choose your Payout Wallet setup:\x1b[0m');
     console.log('  \x1b[36m[1]\x1b[0m Create a NEW $RAIX Wallet (Generates secp256k1 keypair)');
     console.log('  \x1b[36m[2]\x1b[0m Enter my EXISTING $RAIX Address (e.g., ctx1...)');
     console.log('  \x1b[36m[3]\x1b[0m Import via PRIVATE KEY');
-
     const choice = (await askQuestion('\nSelect wallet option [1-3] (default: 1): ')).trim() || '1';
 
     if (choice === '1') {
@@ -244,6 +281,8 @@ async function setupMiner() {
             console.log('\x1b[31mInvalid address format. Defaulting to new wallet.\x1b[0m');
             const keyPair = CortexCrypto.generateKeyPair();
             minerAddress = keyPair.address;
+            console.log(`\x1b[33mNew Payout Address :\x1b[0m \x1b[1;32m${keyPair.address}\x1b[0m`);
+            console.log(`\x1b[31mPrivate Key        :\x1b[0m \x1b[1;31m${keyPair.privateKey}\x1b[0m\n`);
         } else {
             minerAddress = addr;
         }
@@ -257,290 +296,311 @@ async function setupMiner() {
             console.log('\x1b[31mInvalid private key. Generating new wallet.\x1b[0m');
             const keyPair = CortexCrypto.generateKeyPair();
             minerAddress = keyPair.address;
+            console.log(`\x1b[33mNew Payout Address :\x1b[0m \x1b[1;32m${keyPair.address}\x1b[0m`);
+            console.log(`\x1b[31mPrivate Key        :\x1b[0m \x1b[1;31m${keyPair.privateKey}\x1b[0m\n`);
         }
     }
 
-    // 3. Worker Name
-    const workerInput = (await askQuestion(`\nEnter Worker Identifier (default: ${os.hostname().substring(0, 12) || 'worker-1'}): `)).trim();
-    workerId = workerInput || os.hostname().substring(0, 12) || 'worker-1';
+    const workerInput = (await askQuestion(`\nEnter Worker Identifier (default: ${defaultWorker}): `)).trim();
+    workerId = workerInput || defaultWorker;
 
-    // 4. Thread Count
     console.log(`\n\x1b[1mConfigure CPU Mining Power:\x1b[0m`);
     const threadsInput = await askQuestion(`Enter number of threads to allocate [1-${totalCpus}] (default: ${Math.max(1, Math.floor(totalCpus / 2))}): `);
     const parsedThreads = Number(threadsInput.trim());
-    if (parsedThreads >= 1 && parsedThreads <= totalCpus) {
-        allocatedThreads = parsedThreads;
-    }
+    if (parsedThreads >= 1 && parsedThreads <= totalCpus) allocatedThreads = parsedThreads;
 
-    // 5. Node URL
     const nodeInput = await askQuestion(`\nEnter Reticulum Node URL (default: ${NODE_URL}): `);
-    if (nodeInput.trim()) {
-        NODE_URL = sanitizeNodeUrl(nodeInput.trim());
-    }
+    if (nodeInput.trim()) NODE_URL = sanitizeNodeUrl(nodeInput.trim());
 
-    // Save configuration
-    saveConfig({
-        minerAddress,
-        miningMode,
-        workerId,
-        threads: allocatedThreads,
-        nodeUrl: NODE_URL,
-        savedAt: new Date().toISOString()
-    });
-
+    saveConfig({ minerAddress, miningMode, workerId, threads: allocatedThreads, nodeUrl: NODE_URL, savedAt: new Date().toISOString() });
     console.log('\n\x1b[32m✓ Configuration saved to ~/.reticulum/miner_config.json\x1b[0m');
     console.log('\x1b[35mStarting mining dashboard in 2 seconds...\x1b[0m');
-    await new Promise(r => setTimeout(r, 2000));
+    await sleep(2000);
 }
 
-let initialBalance = -1;
-let lastKnownBalance = 0;
-let sessionEarned = 0;
-let localBlocksFound = 0;
-let poolSharesSubmitted = 0;
-let localTotalHashes = 0;
-let localHashrate = 0;
-let spinnerIdx = 0;
-let isMiningRunning = true;
-let currentTemplate: any = null;
-const SPINNERS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const activityLog: string[] = [];
+// ---- share / block submission ----------------------------------------------
+async function handleFoundShare(nonce: number, hash: string, templateIndex: number, jobId: number) {
+    sharesFoundByWorkers++;
+    const tpl = jobTemplates.get(jobId);
+    if (!tpl || jobId !== latestJobId) {
+        sharesStale++;
+        return;
+    }
 
-const activeWorkers: Worker[] = [];
-
-async function handleFoundShare(nonce: number, hash: string, templateIndex: number) {
-    if (!currentTemplate || currentTemplate.index !== templateIndex) return;
-
-    const submitPayload = {
-        minerAddress: minerAddress,
-        workerId: workerId,
+    const payload = {
+        minerAddress,
+        workerId,
         hashrate: localHashrate,
-        index: currentTemplate.index,
-        previousHash: currentTemplate.previousHash,
-        timestamp: currentTemplate.timestamp,
-        transactions: currentTemplate.transactions,
-        difficulty: currentTemplate.difficulty,
-        nonce: nonce,
-        hash: hash
+        index: tpl.index,
+        previousHash: tpl.previousHash,
+        timestamp: tpl.timestamp,
+        transactions: tpl.transactions,
+        difficulty: tpl.difficulty,
+        nonce,
+        hash
     };
 
+    const timeStr = new Date().toLocaleTimeString();
     try {
-        const submitEndpoint = miningMode === 'pool' ? '/api/pool/submit-share' : '/api/miner/submit-block';
-        const submitRes = await fetchJson(submitEndpoint, {
-            method: 'POST',
-            body: submitPayload
-        });
-
-        const timeStr = new Date().toLocaleTimeString();
+        const endpoint = miningMode === 'pool' ? '/api/pool/submit-share' : '/api/miner/submit-block';
+        const res = await fetchJson(endpoint, { method: 'POST', body: payload });
 
         if (miningMode === 'pool') {
-            if (submitRes.validShare) {
-                poolSharesSubmitted++;
-                if (submitRes.blockFound) {
+            if (res.validShare) {
+                poolSharesAccepted++;
+                if (res.blockFound) {
                     localBlocksFound++;
-                    activityLog.unshift(`\x1b[1;35m🎉🎉 [${timeStr}] JACKPOT! Block #${templateIndex} found for the pool! Rewards distributed!\x1b[0m`);
+                    logActivity(`\x1b[1;35m🎉🎉 [${timeStr}] JACKPOT! Block #${templateIndex} found for the pool!\x1b[0m`);
                 } else {
-                    activityLog.unshift(`\x1b[1;32m✓ [${timeStr}] Share Accepted (Diff ${currentTemplate.shareDifficulty})! Total: ${poolSharesSubmitted}\x1b[0m`);
+                    logActivity(`\x1b[1;32m✓ [${timeStr}] Share accepted (diff ${tpl.shareDifficulty}). Total: ${poolSharesAccepted}\x1b[0m`);
                 }
-                if (activityLog.length > 4) activityLog.pop();
+            } else {
+                sharesRejected++;
+                const why = JSON.stringify(res).slice(0, 120);
+                setError(`share REJECTED by node: ${why}`);
+                logActivity(`\x1b[31m✗ [${timeStr}] Share rejected: ${why}\x1b[0m`);
             }
         } else {
-            if (submitRes.success) {
+            if (res.success) {
                 localBlocksFound++;
-                const reward = submitRes.reward || 50;
-                sessionEarned += reward;
-                activityLog.unshift(`\x1b[1;32m💎 [${timeStr}] BLOCK #${templateIndex} SOLVED SOLO! +${reward} CTX REWARD CREDITED!\x1b[0m`);
-                if (activityLog.length > 4) activityLog.pop();
+                logActivity(`\x1b[1;32m💎 [${timeStr}] BLOCK #${templateIndex} SOLVED SOLO! +${res.reward || 50} RAIX credited\x1b[0m`);
+            } else {
+                sharesRejected++;
+                const why = JSON.stringify(res).slice(0, 120);
+                setError(`block REJECTED by node: ${why}`);
+                logActivity(`\x1b[31m✗ [${timeStr}] Block rejected: ${why}\x1b[0m`);
             }
         }
-    } catch (submitErr) {
-        // Stale share / block
+    } catch (e: any) {
+        setError(`submit failed: ${e.message}`);
     }
 }
 
-async function startLocalMiningEngine() {
+// ---- mining engine ----------------------------------------------------------
+function startWorkers() {
     let lastTime = Date.now();
     let lastHashes = 0;
-
     setInterval(() => {
         const now = Date.now();
         const elapsed = (now - lastTime) / 1000;
         if (elapsed >= 0.8) {
-            const done = localTotalHashes - lastHashes;
-            localHashrate = Math.round(done / elapsed);
+            localHashrate = Math.round((localTotalHashes - lastHashes) / elapsed);
             lastTime = now;
             lastHashes = localTotalHashes;
         }
     }, 800);
 
-    // Spawn native OS worker threads for every allocated CPU core
     for (let t = 0; t < allocatedThreads; t++) {
-        const w = new Worker(__filename, {
-            workerData: { threadId: t, totalThreads: allocatedThreads }
+        const w = new Worker(__filename, { workerData: { threadId: t, totalThreads: allocatedThreads } });
+        w.on('message', (msg: any) => {
+            if (msg.type === 'hashes') localTotalHashes += msg.count;
+            else if (msg.type === 'found') handleFoundShare(msg.nonce, msg.hash, msg.templateIndex, msg.jobId);
+            else if (msg.type === 'ready') workersReady++;
+            else if (msg.type === 'error') setError(`worker ${t} hash error: ${msg.message}`);
         });
-        w.on('message', (msg) => {
-            if (msg.type === 'hashes') {
-                localTotalHashes += msg.count;
-            } else if (msg.type === 'found') {
-                handleFoundShare(msg.nonce, msg.hash, msg.templateIndex);
-            }
+        w.on('error', (err: any) => setError(`worker ${t} crashed: ${err?.message || err}`));
+        w.on('exit', (code: number) => {
+            if (isMiningRunning) setError(`worker ${t} exited unexpectedly (code ${code})`);
         });
-        w.on('error', (err) => console.error(`[WORKER ${t}] Error:`, err));
         activeWorkers.push(w);
     }
+}
 
+async function templateLoop() {
     while (isMiningRunning) {
         try {
-            const templateEndpoint = miningMode === 'pool' 
+            const endpoint = miningMode === 'pool'
                 ? `/api/pool/template?address=${encodeURIComponent(minerAddress)}&worker=${encodeURIComponent(workerId)}&hashrate=${localHashrate}`
                 : `/api/miner/template?address=${encodeURIComponent(minerAddress)}`;
 
-            const newTemplate = await fetchJson(templateEndpoint);
-            if (newTemplate && newTemplate.headerPrefix) {
-                const isNew = !currentTemplate || currentTemplate.index !== newTemplate.index || currentTemplate.previousHash !== newTemplate.previousHash;
-                currentTemplate = newTemplate;
+            const t = await fetchJson(endpoint);
 
-                if (isNew) {
-                    const seed = CortexRandomX.getSeedForBlock(currentTemplate.index);
-                    const targetPrefix = miningMode === 'pool' ? currentTemplate.targetSharePrefix : currentTemplate.targetPrefix;
-
-                    const job = {
-                        headerPrefix: currentTemplate.headerPrefix,
-                        headerSuffix: currentTemplate.headerSuffix,
-                        targetPrefix,
-                        seed,
-                        templateIndex: currentTemplate.index
-                    };
-
-                    for (const w of activeWorkers) {
-                        w.postMessage({ type: 'job', job });
-                    }
-                }
+            if (!t || typeof t.headerPrefix !== 'string' || typeof t.headerSuffix !== 'string') {
+                setError(`template has no headerPrefix/headerSuffix: ${JSON.stringify(t).slice(0, 140)}`);
+                await sleep(2000);
+                continue;
             }
 
-            await new Promise(r => setTimeout(r, 1000));
-        } catch (e) {
-            await new Promise(r => setTimeout(r, 2000));
+            const targetPrefix = miningMode === 'pool' ? t.targetSharePrefix : t.targetPrefix;
+            if (typeof targetPrefix !== 'string' || targetPrefix.length === 0) {
+                setError(`template has no ${miningMode === 'pool' ? 'targetSharePrefix' : 'targetPrefix'}: ${JSON.stringify(t).slice(0, 140)}`);
+                await sleep(2000);
+                continue;
+            }
+
+            lastTemplateAt = Date.now();
+            const isNew = !currentTemplate || currentTemplate.index !== t.index || currentTemplate.previousHash !== t.previousHash;
+
+            if (isNew) {
+                currentTemplate = t;
+                const seed = CortexRandomX.getSeedForBlock(t.index);
+                const jobId = nextJobId++;
+                jobTemplates.set(jobId, t);
+                latestJobId = jobId;
+                for (const k of [...jobTemplates.keys()]) if (k < jobId - 3) jobTemplates.delete(k);
+                headerDrift = false;
+                const job = {
+                    headerPrefix: t.headerPrefix,
+                    headerSuffix: t.headerSuffix,
+                    targetPrefix,
+                    seed,
+                    templateIndex: t.index,
+                    jobId
+                };
+                currentJobInfo = `#${t.index}  target "${targetPrefix}"`;
+                for (const w of activeWorkers) w.postMessage({ type: 'job', job });
+            } else if (t.headerPrefix !== currentTemplate.headerPrefix || t.headerSuffix !== currentTemplate.headerSuffix) {
+                // Node hands out a different header on every poll (e.g. fresh timestamp).
+                // Keep hashing and submitting against the job's own template.
+                headerDrift = true;
+            }
+            await sleep(1000);
+        } catch (e: any) {
+            setError(`template: ${e.message}`);
+            await sleep(2000);
         }
     }
 }
 
-async function renderMinerDashboard() {
-    try {
-        const stats = await fetchJson('/api/stats');
-        const poolStats = miningMode === 'pool' ? await fetchJson('/api/pool/stats').catch(() => null) : null;
-        const poolMiner = (miningMode === 'pool' && minerAddress) ? await fetchJson(`/api/pool/miner/${encodeURIComponent(minerAddress)}`).catch(() => null) : null;
-        const balanceData = minerAddress ? await fetchJson(`/api/balance/${minerAddress}`).catch(() => ({ balance: 0 })) : { balance: 0 };
-        const currentBal = Number(balanceData?.balance) || 0;
+// ---- dashboard --------------------------------------------------------------
+const BOX_W = 70;
+const PAD_W = 45;
+const hr = () => '═'.repeat(BOX_W);
+const boxRow = (color: string, label: string, value: string) =>
+    `\x1b[36m║\x1b[0m  ${color}${label.padEnd(20)}\x1b[0m: ${padVisible(value, PAD_W)} \x1b[36m║\x1b[0m`;
 
+async function renderDashboard() {
+    const lines: string[] = [];
+    try {
+        const [stats, poolStats, poolMiner, balanceData] = await Promise.all([
+            fetchJson('/api/stats'),
+            miningMode === 'pool' ? fetchJson('/api/pool/stats').catch(() => null) : Promise.resolve(null),
+            miningMode === 'pool' && minerAddress ? fetchJson(`/api/pool/miner/${encodeURIComponent(minerAddress)}`).catch(() => null) : Promise.resolve(null),
+            minerAddress ? fetchJson(`/api/balance/${minerAddress}`).catch(() => ({ balance: 0 })) : Promise.resolve({ balance: 0 })
+        ]);
+
+        const currentBal = Number(balanceData?.balance) || 0;
         if (initialBalance === -1) {
             initialBalance = currentBal;
             lastKnownBalance = currentBal;
         } else if (currentBal > lastKnownBalance) {
-            const diff = currentBal - lastKnownBalance;
+            logActivity(`\x1b[1;32m💸 [${new Date().toLocaleTimeString()}] PAYOUT CONFIRMED! +${(currentBal - lastKnownBalance).toFixed(4)} $RAIX\x1b[0m`);
             lastKnownBalance = currentBal;
-            const timeStr = new Date().toLocaleTimeString();
-            activityLog.unshift(`\x1b[1;32m💸 [${timeStr}] ON-CHAIN PAYOUT CONFIRMED! +${diff.toFixed(4)} $RAIX CREDITED!\x1b[0m`);
-            if (activityLog.length > 4) activityLog.pop();
         }
-
         const onChainGained = Math.max(0, currentBal - initialBalance);
-        const pendingGains = poolMiner ? (poolMiner.pendingPayout || 0) : 0;
-        const totalSessionGains = onChainGained + pendingGains;
 
         spinnerIdx = (spinnerIdx + 1) % SPINNERS.length;
         const spinner = SPINNERS[spinnerIdx];
 
-        const hr = localHashrate > 0 ? localHashrate : (Math.round(15000 * Math.max(1, allocatedThreads)));
-        const hrFormatted = hr > 1000000 ? `${(hr/1000000).toFixed(2)} MH/s` : hr > 1000 ? `${(hr/1000).toFixed(2)} kH/s` : `${Math.max(1, hr)} H/s`;
+        // Honest engine status (no fake hashrate anymore)
+        let engineStr: string;
+        if (!currentTemplate) {
+            engineStr = `\x1b[1;31m${spinner} WAITING FOR JOB FROM NODE\x1b[0m`;
+        } else if (workersReady < allocatedThreads) {
+            engineStr = `\x1b[1;33m${spinner} INITIALIZING RandomX (${workersReady}/${allocatedThreads} threads ready)\x1b[0m`;
+        } else if (localHashrate === 0) {
+            engineStr = `\x1b[1;33m${spinner} WARMING UP...\x1b[0m`;
+        } else {
+            engineStr = `\x1b[1;32m${spinner} HASHING (${allocatedThreads} threads)\x1b[0m`;
+        }
 
-        const padW = 46;
+        lines.push(`\x1b[36m╔${hr()}╗\x1b[0m`);
+        lines.push(`\x1b[36m║\x1b[0m${padVisible('   \x1b[1;35m🧠 RETICULUM AI ($RAIX) - RANDOMX CPU MINER (TESTNET 2.0)\x1b[0m', BOX_W)}\x1b[36m║\x1b[0m`);
+        lines.push(`\x1b[36m╠${hr()}╣\x1b[0m`);
 
-        clearScreen();
-        console.log('\x1b[36m╔══════════════════════════════════════════════════════════════════════╗\x1b[0m');
-        console.log('\x1b[36m║\x1b[0m   \x1b[1;35m🧠 RETICULUM AI ($RAIX) - RANDOMX CPU MINER (TESTNET 2.0)\x1b[0m        \x1b[36m║\x1b[0m');
-        console.log('\x1b[36m╠══════════════════════════════════════════════════════════════════════╣\x1b[0m');
-        
-        const strategyStr = miningMode === 'pool' ? '\x1b[1;35m● COLLABORATIVE POOL (PPLNS 1% Fee)\x1b[0m' : '\x1b[1;33m● SOLO HARDWARE MINING (Direct L1)\x1b[0m';
-        console.log(`\x1b[36m║\x1b[0m  \x1b[33mMining Strategy\x1b[0m     : ${padVisible(strategyStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const rigStr = `\x1b[1;37m${workerId} (${allocatedThreads} / ${os.cpus().length} Threads)\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[33mWorker / Rig ID\x1b[0m     : ${padVisible(rigStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const addrStr = `\x1b[1;37m${minerAddress.substring(0, 36)}...\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[33mPayout Address\x1b[0m      : ${padVisible(addrStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const balStr = `\x1b[1;32m${currentBal.toFixed(4)} $RAIX\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[1;32mWallet Balance\x1b[0m      : ${padVisible(balStr, padW)} \x1b[36m║\x1b[0m`);
-        
+        lines.push(boxRow('\x1b[33m', 'Mining Strategy', miningMode === 'pool' ? '\x1b[1;35m● COLLABORATIVE POOL (PPLNS 1% Fee)\x1b[0m' : '\x1b[1;33m● SOLO HARDWARE MINING (Direct L1)\x1b[0m'));
+        lines.push(boxRow('\x1b[33m', 'Worker / Rig ID', `\x1b[1;37m${workerId} (${allocatedThreads} / ${os.cpus().length} Threads)\x1b[0m`));
+        lines.push(boxRow('\x1b[33m', 'Payout Address', `\x1b[1;37m${minerAddress.substring(0, 36)}...\x1b[0m`));
+        lines.push(boxRow('\x1b[1;32m', 'Wallet Balance', `\x1b[1;32m${currentBal.toFixed(4)} $RAIX\x1b[0m`));
+
         if (miningMode === 'pool' && poolMiner) {
-            const roundEffortStr = `\x1b[1;33m${poolMiner.roundShares || poolSharesSubmitted} Shares (${poolMiner.roundEffortPercent || '100.0'}% of Round)\x1b[0m`;
-            console.log(`\x1b[36m║\x1b[0m  \x1b[33mRound Contribution\x1b[0m  : ${padVisible(roundEffortStr, padW)} \x1b[36m║\x1b[0m`);
-
-            const blockEstStr = `\x1b[1;35m~${(poolMiner.estimatedBlockReward || 49.50).toFixed(2)} $RAIX on Block Mined\x1b[0m`;
-            console.log(`\x1b[36m║\x1b[0m  \x1b[33mEst. Block Reward\x1b[0m   : ${padVisible(blockEstStr, padW)} \x1b[36m║\x1b[0m`);
+            const shares = poolMiner.roundShares ?? 'n/a';
+            const pct = poolMiner.roundEffortPercent ?? 'n/a';
+            lines.push(boxRow('\x1b[33m', 'Round Contribution', `\x1b[1;33m${shares} Shares (${pct}% of Round)\x1b[0m`));
+            if (typeof poolMiner.estimatedBlockReward === 'number') {
+                lines.push(boxRow('\x1b[33m', 'Est. Block Reward', `\x1b[1;35m~${poolMiner.estimatedBlockReward.toFixed(2)} $RAIX on Block Mined\x1b[0m`));
+            }
+            if (typeof poolMiner.pendingPayout === 'number') {
+                lines.push(boxRow('\x1b[33m', 'Pending Payout', `\x1b[1;33m${poolMiner.pendingPayout.toFixed(4)} $RAIX\x1b[0m`));
+            }
         }
-        
-        const earnStr = `\x1b[1;33m+${onChainGained.toFixed(4)} $RAIX (${miningMode === 'pool' ? poolSharesSubmitted + ' total shares' : localBlocksFound + ' blocks'})\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[33mSession Earnings\x1b[0m    : ${padVisible(earnStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        console.log('\x1b[36m╠══════════════════════════════════════════════════════════════════════╣\x1b[0m');
-        
-        const heightStr = `\x1b[1;37m#${stats.height}\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[34mBlock Height\x1b[0m        : ${padVisible(heightStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const diffStr = `\x1b[1;37m${stats.difficulty}\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[34mNetwork Difficulty\x1b[0m  : ${padVisible(diffStr, padW)} \x1b[36m║\x1b[0m`);
-        
+        lines.push(boxRow('\x1b[33m', 'Session Earnings', `\x1b[1;33m+${onChainGained.toFixed(4)} $RAIX (on-chain)\x1b[0m`));
+
+        lines.push(`\x1b[36m╠${hr()}╣\x1b[0m`);
+        lines.push(boxRow('\x1b[34m', 'Block Height', `\x1b[1;37m#${stats.height}\x1b[0m`));
+        lines.push(boxRow('\x1b[34m', 'Network Difficulty', `\x1b[1;37m${stats.difficulty}\x1b[0m`));
         if (miningMode === 'pool' && poolStats) {
-            const shareDiffStr = `\x1b[1;33m${poolStats.shareDifficulty} (Fast CPU Shares)\x1b[0m`;
-            console.log(`\x1b[36m║\x1b[0m  \x1b[34mPool Share Diff\x1b[0m     : ${padVisible(shareDiffStr, padW)} \x1b[36m║\x1b[0m`);
-            
-            const poolHr = poolStats.totalPoolHashrate || 0;
-            const poolHrFormatted = poolHr > 1000000 ? `${(poolHr/1000000).toFixed(2)} MH/s` : poolHr > 1000 ? `${(poolHr/1000).toFixed(2)} kH/s` : `${poolHr} H/s`;
-            const poolHrBoxStr = `\x1b[1;35m${poolHrFormatted} (${poolStats.connectedMinersCount} Worker${poolStats.connectedMinersCount === 1 ? '' : 's'})\x1b[0m`;
-            console.log(`\x1b[36m║\x1b[0m  \x1b[35mTotal Pool Hashrate\x1b[0m : ${padVisible(poolHrBoxStr, padW)} \x1b[36m║\x1b[0m`);
+            lines.push(boxRow('\x1b[34m', 'Pool Share Diff', `\x1b[1;33m${poolStats.shareDifficulty} (Fast CPU Shares)\x1b[0m`));
+            const n = poolStats.connectedMinersCount;
+            lines.push(boxRow('\x1b[35m', 'Total Pool Hashrate', `\x1b[1;35m${fmtRate(poolStats.totalPoolHashrate || 0)} (${n} Worker${n === 1 ? '' : 's'})\x1b[0m`));
         }
-        
-        const netHr = stats.networkHashrate || 0;
-        const netHrFormatted = netHr > 1000000 ? `${(netHr/1000000).toFixed(2)} MH/s` : netHr > 1000 ? `${(netHr/1000).toFixed(2)} kH/s` : `${netHr} H/s`;
-        const netHrBoxStr = `\x1b[1;36m${netHrFormatted} (L1 Consensus)\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[34mGlobal Net Hashrate\x1b[0m : ${padVisible(netHrBoxStr, padW)} \x1b[36m║\x1b[0m`);
+        lines.push(boxRow('\x1b[34m', 'Global Net Hashrate', `\x1b[1;36m${fmtRate(stats.networkHashrate || 0)} (L1 Consensus)\x1b[0m`));
+        lines.push(boxRow('\x1b[34m', 'Total Burned $RAIX', `\x1b[1;31m${(Number(stats.totalBurned) || 0).toFixed(3)} $RAIX 🔥\x1b[0m`));
 
-        const burnStr = `\x1b[1;31m${stats.totalBurned.toFixed(3)} $RAIX 🔥\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[34mTotal Burned $RAIX\x1b[0m    : ${padVisible(burnStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        console.log('\x1b[36m╠══════════════════════════════════════════════════════════════════════╣\x1b[0m');
-        
-        const engineStr = `\x1b[1;32m${spinner} ACTIVE (Native CPU RandomX)\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[32mHardware Engine\x1b[0m     : ${padVisible(engineStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const hrBoxStr = `\x1b[1;32m${hrFormatted}\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[32mYour Rig Hashrate\x1b[0m   : ${padVisible(hrBoxStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const sharesBoxStr = `\x1b[1;33m${miningMode === 'pool' ? poolSharesSubmitted + ' Shares' : localBlocksFound + ' Blocks'}\x1b[0m`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[32mShares / Blocks Mined\x1b[0m: ${padVisible(sharesBoxStr, padW)} \x1b[36m║\x1b[0m`);
-        
-        const hashesStr = `${localTotalHashes.toLocaleString()}`;
-        console.log(`\x1b[36m║\x1b[0m  \x1b[32mLocal Hashes Checked\x1b[0m: ${padVisible(hashesStr, padW)} \x1b[36m║\x1b[0m`);
-        console.log('\x1b[36m╚══════════════════════════════════════════════════════════════════════╝\x1b[0m');
-
-        if (activityLog.length > 0) {
-            console.log('\n\x1b[1m📜 Mining Activity & Pool Rewards Log:\x1b[0m');
-            activityLog.forEach(log => console.log('  ' + log));
-        }
-
-        console.log('\n\x1b[90mPress [Ctrl+C] to stop mining. Real-time CPU hashing active...\x1b[0m');
+        lines.push(`\x1b[36m╠${hr()}╣\x1b[0m`);
+        lines.push(boxRow('\x1b[32m', 'Hardware Engine', engineStr));
+        lines.push(boxRow('\x1b[32m', 'Your Rig Hashrate', `\x1b[1;32m${fmtRate(localHashrate)}\x1b[0m`));
+        lines.push(boxRow('\x1b[32m', 'Local Hashes Checked', `${localTotalHashes.toLocaleString()}`));
+        const jobAge = lastTemplateAt ? `${Math.round((Date.now() - lastTemplateAt) / 1000)}s ago` : 'never';
+        lines.push(boxRow('\x1b[32m', 'Current Job', currentJobInfo ? `${currentJobInfo} (refreshed ${jobAge})` : 'none received yet'));
+        if (headerDrift) lines.push(boxRow('\x1b[32m', 'Template Note', '\x1b[90mnode header changes each poll (handled)\x1b[0m'));
+        const shareLine = miningMode === 'pool'
+            ? `found ${sharesFoundByWorkers} | ok ${poolSharesAccepted} | rej ${sharesRejected} | stale ${sharesStale}`
+            : `found ${sharesFoundByWorkers} | blocks ${localBlocksFound} | rej ${sharesRejected} | stale ${sharesStale}`;
+        lines.push(boxRow('\x1b[32m', 'Shares', `\x1b[1;33m${shareLine}\x1b[0m`));
+        lines.push(`\x1b[36m╚${hr()}╝\x1b[0m`);
     } catch (err: any) {
-        console.log(`\x1b[31m[ERROR] Connection error with ${NODE_URL}: ${err.message}\x1b[0m`);
+        lines.push(`\x1b[31m[ERROR] Dashboard update failed: ${err.message}\x1b[0m`);
+    }
+
+    if (lastError) {
+        const age = Math.round((Date.now() - lastErrorAt) / 1000);
+        lines.push(`\n\x1b[1;31m⚠ LAST ERROR (${age}s ago): ${lastError}\x1b[0m`);
+    }
+    if (activityLog.length > 0) {
+        lines.push('\n\x1b[1m📜 Mining Activity & Pool Rewards Log:\x1b[0m');
+        activityLog.forEach(l => lines.push('  ' + l));
+    }
+    lines.push('\n\x1b[90mPress [Ctrl+C] to stop mining.\x1b[0m');
+
+    // single write, no full-screen flash
+    process.stdout.write('\x1b[H\x1b[J' + lines.join('\n') + '\n');
+}
+
+async function dashboardLoop() {
+    while (isMiningRunning) {
+        await renderDashboard();
+        await sleep(800);
     }
 }
 
-async function main() {
-    await setupMiner();
-    startLocalMiningEngine();
-    setInterval(renderMinerDashboard, 800);
+// ---- shutdown ---------------------------------------------------------------
+function shutdown() {
+    isMiningRunning = false;
+    for (const w of activeWorkers) {
+        try { w.terminate(); } catch {}
+    }
+    try { rl?.close(); } catch {}
+    process.stdout.write('\n\x1b[0mMiner stopped.\n');
+    process.exit(0);
 }
 
-main();
+async function runMain() {
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+
+    await setupMiner();
+    rl?.close(); // otherwise readline swallows Ctrl+C
+    rl = null;
+
+    process.stdout.write('\x1b[2J');
+    startWorkers();
+    templateLoop();
+    dashboardLoop();
+}
+
+if (isMainThread) {
+    runMain();
+} else {
+    runWorker();
 }
